@@ -3,8 +3,6 @@
 import akka.Done;
 import akka.NotUsed;
 import akka.actor.*;
-import akka.event.Logging;
-import akka.event.LoggingAdapter;
 import akka.http.javadsl.ConnectHttp;
 import akka.http.javadsl.ConnectionContext;
 import akka.http.javadsl.Http;
@@ -19,16 +17,13 @@ import akka.http.javadsl.settings.ClientConnectionSettings;
 import akka.http.javadsl.settings.ServerSettings;
 import akka.http.javadsl.settings.WebSocketSettings;
 import akka.japi.Function;
-import akka.japi.JavaPartialFunction;
 import akka.stream.ActorMaterializer;
 import akka.stream.Materializer;
 import akka.stream.OverflowStrategy;
-import akka.stream.javadsl.AsPublisher;
 import akka.stream.javadsl.Flow;
 import akka.stream.javadsl.Sink;
 import akka.stream.javadsl.Source;
 import akka.util.ByteString;
-import org.reactivestreams.Publisher;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -43,6 +38,10 @@ public class WebSocketCoreExample {
     public static Source<Message, ActorRef> source = Source.actorRef(100, OverflowStrategy.dropHead());
     public static ActorRef actorRef = null;
     public static ActorSystem system = null;
+
+    public static ActorRef actor;
+    public static ActorRef destinationRefParent;
+
 
     {
         ActorSystem system = null;
@@ -100,15 +99,44 @@ public class WebSocketCoreExample {
         //#websocket-client-ping-payload
     }
 
+    //#websocket-handling
+    public static HttpResponse handleRequest(HttpRequest request, Materializer materializer) {
+        System.out.println("Handling request to " + request.getUri());
+
+        Sink<Message, CompletionStage<Done>> sink = Sink.foreach(e -> System.out.println(e.asTextMessage().getStrictText()));
+        Flow<Message, Message, NotUsed> flow = Flow.fromSinkAndSource(sink, source);
+
+        if (request.getUri().path().equals("/greeter")) {
+
+
+            return WebSocket.handleWebSocketRequestWith(request,
+                    createWebSocketFlow());
+
+        }
+        if (request.getUri().path().equals("/sendMessage")) {
+
+            //actor.tell(new WebSocketCoreExample.Incoming("Hi"), ActorRef.noSender());
+
+            destinationRefParent.tell(new Outgoing("got it sendMessage"), ActorRef.noSender());
+
+//            system.scheduler().schedule(Duration.ZERO, Duration.ofMillis(3000), actor,
+//                    new WebSocketCoreExample.Incoming("Hi"), ActorRef.noSender());
+            return HttpResponse.create().withStatus(200);
+        } else {
+            return HttpResponse.create().withStatus(404);
+        }
+    }
+
     static Flow<Message, Message, NotUsed> createWebSocketFlow() {
-        ActorRef actor = system.actorOf(Props.create(AnActor.class));
 
         Source<Message, NotUsed> source = Source.<Outgoing>actorRef(5, OverflowStrategy.fail())
                 .map((outgoing) -> (Message) TextMessage.create(outgoing.message))
                 .<NotUsed>mapMaterializedValue(destinationRef -> {
+                    destinationRefParent = destinationRef;
                     actor.tell(new OutgoingDestination(destinationRef), ActorRef.noSender());
                     return NotUsed.getInstance();
                 });
+
 
         Sink<Message, NotUsed> sink = Flow.<Message>create()
                 .map((msg) -> new Incoming(msg.asTextMessage().getStrictText()))
@@ -118,47 +146,6 @@ public class WebSocketCoreExample {
         return Flow.fromSinkAndSource(sink, source);
     }
 
-    //#websocket-handling
-    public static HttpResponse handleRequest(HttpRequest request, Materializer materializer) {
-        System.out.println("Handling request to " + request.getUri());
-
-
-        if (actorRef == null) {
-            actorRef = source.to(Sink.foreach(e -> System.out.println(e.asTextMessage().getStrictText()))).run(materializer);
-
-            Sink<Message, Publisher<Message>> publisher = Sink.asPublisher(AsPublisher.WITHOUT_FANOUT);
-            source.to(Sink.asPublisher(AsPublisher.WITHOUT_FANOUT)).run(materializer);
-
-            //Source.fromPublisher(publisher);
-
-            actorRef.tell(TextMessage.create("Hello"), ActorRef.noSender());
-        }
-
-        //Source<Message, NotUsed> source = Source.single(TextMessage.create("Hai Single message"));
-        Sink<Message, CompletionStage<Done>> sink = Sink.foreach(e -> System.out.println(e.asTextMessage().getStrictText()));
-        Flow<Message, Message, NotUsed> flow = Flow.fromSinkAndSource(sink, source);
-
-        if (request.getUri().path().equals("/greeter")) {
-
-            //Source<Message,ActorRef> source = Source.actorPublisher(IotSupervisor.props());
-            //final Flow<Message, Message, NotUsed> greeterFlow = greeter();
-            return WebSocket.handleWebSocketRequestWith(request,
-                    createWebSocketFlow());
-
-            //return WebSocket.handleWebSocketRequestWith(request, greeterFlow);
-        }
-        if (request.getUri().path().equals("/sendMessage")) {
-
-            ActorRef supervisor = system.actorOf(IotSupervisor.props(), "iot");
-            //source.watch()
-            supervisor.tell(TextMessage.create("Hello"), ActorRef.noSender());
-
-            return HttpResponse.create().withStatus(200);
-        } else {
-            return HttpResponse.create().withStatus(404);
-        }
-    }
-
     public static void main(String[] args) throws Exception {
         system = ActorSystem.create();
 
@@ -166,6 +153,9 @@ public class WebSocketCoreExample {
             final Materializer materializer = ActorMaterializer.create(system);
 
             final Function<HttpRequest, HttpResponse> handler = request -> handleRequest(request, materializer);
+
+            actor = system.actorOf(Props.create(AnActor.class));
+
             CompletionStage<ServerBinding> serverBindingFuture =
                     Http.get(system).bindAndHandleSync(
                             handler, ConnectHttp.toHost("localhost", 8080), materializer);
@@ -180,30 +170,6 @@ public class WebSocketCoreExample {
         }
     }
 
-    /**
-     * A handler that treats incoming messages as a name,
-     * and responds with a greeting to that name
-     */
-    public static Flow<Message, Message, NotUsed> greeter() {
-        return
-                Flow.<Message>create()
-                        .collect(new JavaPartialFunction<Message, Message>() {
-                            @Override
-                            public Message apply(Message msg, boolean isCheck) throws Exception {
-                                if (isCheck) {
-                                    if (msg.isText()) {
-                                        return null;
-                                    } else {
-                                        throw noMatch();
-                                    }
-                                } else {
-                                    return handleTextMessage(msg.asTextMessage());
-                                }
-                            }
-                        });
-    }
-    //#websocket-handling
-
     public static TextMessage handleTextMessage(TextMessage msg) {
         if (msg.isStrict()) // optimization that directly creates a simple response...
         {
@@ -211,6 +177,32 @@ public class WebSocketCoreExample {
         } else // ... this would suffice to handle all text messages in a streaming fashion
         {
             return TextMessage.create(Source.single("Hello ").concat(msg.getStreamedText()));
+        }
+    }
+
+    //#websocket-handling
+
+    static class AnActor extends AbstractActor {
+
+        private Optional<ActorRef> outgoing = Optional.empty();
+
+
+        @Override
+        public Receive createReceive() {
+            return receiveBuilder().match(
+                    OutgoingDestination.class, (msg) -> setActorRef(msg)
+            ).match(
+                    Incoming.class, (in) -> handleIncomingMessage(in)
+            ).build();
+        }
+
+        private Optional<ActorRef> setActorRef(OutgoingDestination msg) {
+            outgoing = Optional.ofNullable(msg.destination);
+            return outgoing;
+        }
+
+        private void handleIncomingMessage(Incoming in) {
+            outgoing.ifPresent((out) -> out.tell(new Outgoing("got it" + in.message), self()));
         }
     }
 
@@ -241,42 +233,6 @@ public class WebSocketCoreExample {
         }
     }
 
-    static class AnActor extends AbstractActor {
 
-        private Optional<ActorRef> outgoing = Optional.empty();
-
-        @Override
-        public Receive createReceive() {
-            return receiveBuilder().match(
-                    OutgoingDestination.class, (msg) -> outgoing = Optional.of(msg.destination)
-            ).match(
-                    Incoming.class, (in) -> outgoing.ifPresent((out) -> out.tell(new Outgoing("got it"), self()))
-            ).build();
-        }
-    }
-
-    public static class IotSupervisor extends AbstractActor {
-        private final LoggingAdapter log = Logging.getLogger(getContext().getSystem(), this);
-
-        public static Props props() {
-            return Props.create(IotSupervisor.class, IotSupervisor::new);
-        }
-
-        @Override
-        public void preStart() {
-            log.info("IoT Application started");
-        }
-
-        @Override
-        public void postStop() {
-            log.info("IoT Application stopped");
-        }
-
-        // No need to handle any messages
-        @Override
-        public Receive createReceive() {
-            return receiveBuilder().build();
-        }
-    }
 }
 //#websocket-example-using-core
