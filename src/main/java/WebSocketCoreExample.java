@@ -27,6 +27,7 @@ import akka.util.ByteString;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
@@ -41,6 +42,7 @@ public class WebSocketCoreExample {
 
     public static ActorRef actor;
     public static ActorRef destinationRefParent;
+    public static ActorRef destinationRefParentStreams;
 
 
     {
@@ -99,15 +101,32 @@ public class WebSocketCoreExample {
         //#websocket-client-ping-payload
     }
 
+    static Flow<Message, Message, NotUsed> createWebSocketFlow() {
+
+        Source<Message, NotUsed> source = Source.<Outgoing>actorRef(5, OverflowStrategy.fail())
+                .map((outgoing) -> (Message) TextMessage.create(outgoing.message))
+                .<NotUsed>mapMaterializedValue(destinationRef -> {
+                    destinationRefParent = destinationRef;
+                    actor.tell(new OutgoingDestination(destinationRef), ActorRef.noSender());
+                    return NotUsed.getInstance();
+                }).keepAlive(Duration.ofSeconds(10), () -> TextMessage.create("Keep-alive message sent to WebSocket recipient"));
+
+
+        Sink<Message, NotUsed> sink = Flow.<Message>create()
+                .map((msg) -> new Incoming(msg.asTextMessage().getStrictText()))
+                .to(Sink.actorRef(actor, PoisonPill.getInstance()));
+
+
+        return Flow.fromSinkAndSource(sink, source);
+    }
     //#websocket-handling
     public static HttpResponse handleRequest(HttpRequest request, Materializer materializer) {
-        System.out.println("Handling request to " + request.getUri());
+        //System.out.println("Handling request to " + request.getUri());
 
         Sink<Message, CompletionStage<Done>> sink = Sink.foreach(e -> System.out.println(e.asTextMessage().getStrictText()));
         Flow<Message, Message, NotUsed> flow = Flow.fromSinkAndSource(sink, source);
 
         if (request.getUri().path().equals("/greeter")) {
-
 
             return WebSocket.handleWebSocketRequestWith(request,
                     createWebSocketFlow());
@@ -118,6 +137,7 @@ public class WebSocketCoreExample {
             //actor.tell(new WebSocketCoreExample.Incoming("Hi"), ActorRef.noSender());
 
             destinationRefParent.tell(new Outgoing("got it sendMessage"), ActorRef.noSender());
+            destinationRefParentStreams.tell(new Integer(1), ActorRef.noSender());
 
 //            system.scheduler().schedule(Duration.ZERO, Duration.ofMillis(3000), actor,
 //                    new WebSocketCoreExample.Incoming("Hi"), ActorRef.noSender());
@@ -127,23 +147,23 @@ public class WebSocketCoreExample {
         }
     }
 
-    static Flow<Message, Message, NotUsed> createWebSocketFlow() {
+    private static void initializeStreams(Materializer materializer) {
 
-        Source<Message, NotUsed> source = Source.<Outgoing>actorRef(5, OverflowStrategy.fail())
-                .map((outgoing) -> (Message) TextMessage.create(outgoing.message))
+        Source<Integer, NotUsed> source = Source.<Integer>actorRef(5000, OverflowStrategy.dropTail())
+                .map(i -> i)
                 .<NotUsed>mapMaterializedValue(destinationRef -> {
-                    destinationRefParent = destinationRef;
-                    actor.tell(new OutgoingDestination(destinationRef), ActorRef.noSender());
+                    destinationRefParentStreams = destinationRef;
                     return NotUsed.getInstance();
                 });
 
+        Flow<Integer, Integer, NotUsed> sample = Flow.create();
 
-        Sink<Message, NotUsed> sink = Flow.<Message>create()
-                .map((msg) -> new Incoming(msg.asTextMessage().getStrictText()))
-                .to(Sink.actorRef(actor, PoisonPill.getInstance()));
+        Sink<Integer, NotUsed> sink = sample.
+                conflateWithSeed(Summed::new, (Summed acc, Integer el) -> acc.sum(new Summed(el))).
+                zip(Source.tick(Duration.ofSeconds(1), Duration.ofSeconds(1), NotUsed.notUsed())).
+                to(Sink.foreach(System.out::print)).named("sample");
 
-
-        return Flow.fromSinkAndSource(sink, source);
+        sample.runWith(source, sink, materializer);
     }
 
     public static void main(String[] args) throws Exception {
@@ -155,6 +175,8 @@ public class WebSocketCoreExample {
             final Function<HttpRequest, HttpResponse> handler = request -> handleRequest(request, materializer);
 
             actor = system.actorOf(Props.create(AnActor.class));
+
+            WebSocketCoreExample.initializeStreams(materializer);
 
             CompletionStage<ServerBinding> serverBindingFuture =
                     Http.get(system).bindAndHandleSync(
